@@ -65,12 +65,22 @@ jobs:
           python -B -m unittest -q \
             tests.test_opaque_bidirectional_capsule_v1 \
             tests.test_opaque_bidirectional_capsule_p256_aesgcm_v1
-      - name: Execute encrypted request and encrypted private-canary return
+      - name: Execute encrypted request and runtime-private-canary return
         shell: bash
         run: |
           set -euo pipefail
           ulimit -c 0
           python -B scripts/opaque_bidirectional_capsule_smoke_v1.py
+      - name: Prove isolated worker key custody and encrypted two-process handoff
+        shell: bash
+        run: |
+          set -euo pipefail
+          ulimit -c 0
+          # Do not permit an ephemeral plaintext synthetic workload to reach guest swap.
+          sudo -n swapoff -a || { echo "CLEAN_ROOM_GUEST_SWAP=FAIL_CLOSED"; exit 1; }
+          python -B scripts/opaque_bidirectional_capsule_smoke_v1.py --two-process
+          python -B scripts/opaque_bidirectional_capsule_smoke_v1.py --two-process-tamper
+          python -B scripts/opaque_bidirectional_capsule_smoke_v1.py --two-process-wrong-run
       - name: Fail closed if generated public artifact contains non-envelope data
         shell: bash
         run: |
