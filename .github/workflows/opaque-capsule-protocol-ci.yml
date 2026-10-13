@@ -131,12 +131,13 @@ jobs:
           retention-days: 1
 
 
-  # A separate public Actions job audits what GitHub actually published by
-  # reading the completed protocol job log and uploaded artifact through API.
+  # A separate read-only Actions job audits the completed protocol OR the
+  # trusted-base external synthetic exchange's public log/artifact through API.
   # No source private key or canary is transferred to this auditor.
   audit_publication:
     name: audit-publication
-    needs: [protocol]
+    needs: [protocol, external_synthetic_exchange]
+    if: ${{ always() && (needs.protocol.result == 'success' || needs.external_synthetic_exchange.result == 'success') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -146,6 +147,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       RUN_ID: ${{ github.run_id }}
       REPO: ${{ github.repository }}
+      EVENT: ${{ github.event_name }}
     steps:
       - name: Independently inspect public job log and artifact through GitHub API
         shell: bash
@@ -248,13 +250,29 @@ jobs:
               if not re.fullmatch(r"[0-9]{1,24}", run_id):
                   raise ValueError("run")
               prefix = "/repos/" + repo
+              is_external = os.environ["EVENT"] == "pull_request_target"
+              if os.environ["EVENT"] not in {"push", "pull_request", "workflow_dispatch", "pull_request_target"}:
+                  raise ValueError("event_rejected")
+              job_name = "external_synthetic_exchange" if is_external else "protocol"
+              artifact_name = ("opaque-external-result-envelope" if is_external
+                               else "opaque-result-envelope")
+              required_receipts = (
+                  (b"CLEAN_EXTERNAL_PUBLIC_OFFER_PUBLISHED=1",
+                   b"CLEAN_EXTERNAL_PUBLIC_CIPHERTEXT_RESULT_PUBLISHED=1",
+                   b"CLEAN_EXTERNAL_PUBLIC_ENCRYPTED_RESULT=PASS",
+                   b"CLEAN_EXTERNAL_DURABLE_PRIVATE_ACK=0")
+                  if is_external else
+                  (b"OPAQUE_CAPSULE_PROTOCOL_PASS=1",
+                   b"CLEAN_ROOM_ARTIFACT_CIPHERTEXT_ONLY=PASS",
+                   b"CLEAN_ROOM_PRIVATE_CONSUMER_DURABLE_ACK=0")
+              )
               STAGE[0] = "JOBS_API"
               jobs = api_json(prefix + "/actions/runs/" + run_id + "/jobs?per_page=100")
               if jobs.get("total_count", 0) > 100:
                   raise ValueError("unbounded_jobs")
               protocol_jobs = [
                   j for j in jobs["jobs"]
-                  if j.get("name") == "protocol"
+                  if j.get("name") == job_name
                   and j.get("status") == "completed"
                   and j.get("conclusion") == "success"
               ]
@@ -276,12 +294,12 @@ jobs:
               )
               if any(re.search(pattern, logs) for pattern in forbidden):
                   raise ValueError("log_private_pattern")
-              if b"OPAQUE_CAPSULE_PROTOCOL_PASS=1" not in logs:
-                  raise ValueError("missing_protocol_receipt")
-              if b"CLEAN_ROOM_ARTIFACT_CIPHERTEXT_ONLY=PASS" not in logs:
-                  raise ValueError("missing_artifact_receipt")
-              if b"CLEAN_ROOM_PRIVATE_CONSUMER_DURABLE_ACK=0" not in logs:
-                  raise ValueError("missing_ack_boundary")
+              if any(receipt not in logs for receipt in required_receipts):
+                  raise ValueError("missing_required_receipt")
+              if is_external and re.search(
+                  rb"SYNTHETIC-EXTERNAL-CANARY-[0-9a-f]{64}", logs,
+              ):
+                  raise ValueError("external_canary_log_pattern")
 
               STAGE[0] = "ARTIFACT_LIST_API"
               for attempt in range(5):
@@ -295,7 +313,7 @@ jobs:
               if listing.get("total_count") != 1 or len(artifacts) != 1:
                   raise ValueError("unexpected_artifacts")
               artifact = artifacts[0]
-              if artifact.get("name") != "opaque-result-envelope" or artifact.get("expired"):
+              if artifact.get("name") != artifact_name or artifact.get("expired"):
                   raise ValueError("artifact_name")
               STAGE[0] = "ARTIFACT_ZIP_API"
               archive = publication_retry(lambda: download_without_forwarding_token(
@@ -316,8 +334,12 @@ jobs:
                   "sender_public_b64", "nonce_b64", "ciphertext_b64",
                   "ciphertext_sha256",
               }
+              expected_schema = (
+                  "opaque-capsule-p256-aesgcm-v1" if is_external
+                  else "opaque-capsule-v1"
+              )
               if (not isinstance(obj, dict) or set(obj) != allowed
-                      or obj["schema"] != "opaque-capsule-v1"
+                      or obj["schema"] != expected_schema
                       or obj["direction"] != "result" or obj["run_id"] != run_id
                       or not isinstance(obj["recipient_key_id"], str)
                       or not obj["recipient_key_id"].startswith("sha256:")):
@@ -326,7 +348,7 @@ jobs:
               sender = base64.b64decode(obj["sender_public_b64"], validate=True)
               nonce = base64.b64decode(obj["nonce_b64"], validate=True)
               ciphertext = base64.b64decode(obj["ciphertext_b64"], validate=True)
-              if (len(sender) != 32 or len(nonce) != 12
+              if (len(sender) != (33 if is_external else 32) or len(nonce) != 12
                       or len(ciphertext) - 16 not in (4096, 16384, 65536, 262144, 1048576)
                       or hashlib.sha256(ciphertext).hexdigest() != obj["ciphertext_sha256"]):
                   raise ValueError("public_ciphertext_integrity")
