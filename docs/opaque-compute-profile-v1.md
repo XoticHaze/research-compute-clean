@@ -110,3 +110,5 @@ A reusable public-compute consumer must prove:
 - private authority can decrypt and validate the returned result.
 
 Confidential-compute acceptance additionally requires remote-attestation proof and key-release binding.
+
+<!-- External synthetic proof trigger only. No user/private data; no production cutover. -->
