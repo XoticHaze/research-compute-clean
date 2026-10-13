@@ -162,5 +162,47 @@ class ExternalPrivateAuthorityCapsuleTests(unittest.TestCase):
             self._execute(seal(bad, recipient_public_b64=self.worker_public,
                                run_id="12345", direction="request"))
 
+
+class ExternalTrustedPublisherGuards(unittest.TestCase):
+    def test_write_publisher_denies_untrusted_context_before_cryptography(self):
+        import os
+        from unittest.mock import patch
+        from scripts.opaque_bidirectional_capsule_smoke_v1 import external_worker
+        safe = {
+            "GITHUB_RUN_ID": "38369009618",
+            "GITHUB_REPOSITORY": "XoticHaze/research-compute-clean",
+            "GITHUB_REPOSITORY_ID": "1416551057",
+            "GITHUB_BASE_REF": "main",
+            "GITHUB_EVENT_NAME": "pull_request_target",
+            "GITHUB_HEAD_REF": "security/clean-external-probe-20261013",
+        }
+        for key, bad in (
+            ("GITHUB_EVENT_NAME", "pull_request"),
+            ("GITHUB_REPOSITORY_ID", "1358005162"),
+            ("GITHUB_BASE_REF", "untrusted"),
+            ("GITHUB_HEAD_REF", "attack-branch"),
+            ("GITHUB_REPOSITORY", "XoticHaze/research-compute-public-"),
+        ):
+            with self.subTest(key=key):
+                with patch.dict(os.environ, {**safe, key: bad}), patch(
+                    "scripts.opaque_bidirectional_capsule_p256_aesgcm_v1.generate_keypair",
+                    side_effect=AssertionError("key generation before guard forbidden"),
+                ):
+                    self.assertEqual(external_worker(publish_offer=True), 1)
+
+    def test_seven_file_allowlist_and_ref_main_guard_exist(self):
+        from pathlib import Path
+        workflow = Path(".github/workflows/opaque-capsule-protocol-ci.yml").read_text()
+        self.assertIn("pull_request_target:", workflow)
+        self.assertIn("external_synthetic_exchange:", workflow)
+        self.assertIn("persist-credentials: false", workflow)
+        self.assertIn("ref: main", workflow)
+        self.assertIn("contents: write", workflow)
+        self.assertIn("contents: read", workflow)
+        self.assertIn("github.event.pull_request.head.repo.full_name == github.repository", workflow)
+        self.assertIn("GITHUB_REPOSITORY_ID", Path(
+            "scripts/opaque_bidirectional_capsule_smoke_v1.py").read_text())
+        self.assertNotIn("actions/checkout@v", workflow)
+
 if __name__ == "__main__":
     unittest.main()
