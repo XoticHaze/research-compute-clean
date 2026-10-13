@@ -112,3 +112,5 @@ A reusable public-compute consumer must prove:
 Confidential-compute acceptance additionally requires remote-attestation proof and key-release binding.
 
 <!-- External synthetic proof trigger only. No user/private data; no production cutover. -->
+
+<!-- Bounded synthetic external proof rerun after trusted-base offer publication; no live job authority. -->
