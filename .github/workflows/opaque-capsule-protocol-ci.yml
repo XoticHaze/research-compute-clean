@@ -12,6 +12,8 @@ on:
       - 'docs/opaque-compute-profile-v1.md'
       - '.github/workflows/opaque-capsule-protocol-ci.yml'
   pull_request:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 permissions:
@@ -19,6 +21,7 @@ permissions:
 
 jobs:
   protocol:
+    if: ${{ github.event_name != 'pull_request_target' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
@@ -335,3 +338,61 @@ jobs:
               sys.exit(1)
           print("CLEAN_ROOM_INDEPENDENT_PUBLICATION_AUDIT=PASS")
           PY
+
+  # Only trusted base/main source is ever executed with job-scoped contents
+  # write permission. Never checkout a PR head or use PR-owned scripts here.
+  external_synthetic_exchange:
+    if: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.ref == 'main' && startsWith(github.event.pull_request.head.ref, 'security/clean-external-probe-') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    permissions:
+      contents: write
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Checkout trusted clean main only
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.11.16'
+      - name: Verify trusted seven-file source-only boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import subprocess
+          expected={
+              'docs/opaque-compute-profile-v1.md',
+              'scripts/opaque_bidirectional_capsule_v1.py',
+              'scripts/opaque_bidirectional_capsule_p256_aesgcm_v1.py',
+              'scripts/opaque_bidirectional_capsule_smoke_v1.py',
+              'tests/test_opaque_bidirectional_capsule_v1.py',
+              'tests/test_opaque_bidirectional_capsule_p256_aesgcm_v1.py',
+              '.github/workflows/opaque-capsule-protocol-ci.yml',
+          }
+          found=set(subprocess.check_output(['git','ls-tree','-r','--name-only','HEAD'],text=True).splitlines())
+          if found!=expected:
+              raise SystemExit('CLEAN_EXTERNAL_TRUSTED_SOURCE=FAIL_CLOSED')
+          print('CLEAN_EXTERNAL_TRUSTED_SOURCE=PASS')
+          PY
+      - name: Install exact crypto dependency
+        run: python -m pip install --disable-pip-version-check cryptography==46.0.1
+      - name: Publish one-run public offer and consume bounded encrypted synthetic input
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ulimit -c 0
+          sudo -n swapoff -a || { echo "CLEAN_EXTERNAL_GUEST_SWAP=FAIL_CLOSED"; exit 1; }
+          python -B scripts/opaque_bidirectional_capsule_smoke_v1.py --external-synthetic-worker-publish
+      - name: Upload ciphertext-only one-day external result
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: opaque-external-result-envelope
+          path: opaque-result-envelope.json
+          if-no-files-found: error
+          retention-days: 1
