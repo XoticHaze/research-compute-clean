@@ -126,3 +126,184 @@ jobs:
           path: opaque-result-envelope.json
           if-no-files-found: error
           retention-days: 1
+
+
+  # A separate public Actions job audits what GitHub actually published by
+  # reading the completed protocol job log and uploaded artifact through API.
+  # No source private key or canary is transferred to this auditor.
+  audit_publication:
+    name: audit-publication
+    needs: [protocol]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN_ID: ${{ github.run_id }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Independently inspect public job log and artifact through GitHub API
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import base64
+          import hashlib
+          import io
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          import zipfile
+
+          # This job never receives the runtime-only canary or a private key.
+          # Do not echo remote content, URLs, HTTP errors, tokens or artifacts.
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+          def read_bounded(response, limit):
+              with response:
+                  data = response.read(limit + 1)
+              if len(data) > limit:
+                  raise ValueError("response_size")
+              return data
+
+          def request(path):
+              return urllib.request.Request(
+                  "https://api.github.com" + path,
+                  headers={
+                      "Accept": "application/vnd.github+json",
+                      "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+                      "User-Agent": "clean-publication-auditor-v1",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                  },
+              )
+
+          def api_json(path):
+              with urllib.request.urlopen(request(path), timeout=20) as resp:
+                  return json.load(resp)
+
+          def download_without_forwarding_token(path, limit):
+              # GitHub sends a short-lived signed URL for log/artifact bytes.
+              # Never forward the Actions token to that redirected host.
+              try:
+                  with urllib.request.build_opener(NoRedirect()).open(
+                      request(path), timeout=20,
+                  ):
+                      raise ValueError("expected_redirect")
+              except urllib.error.HTTPError as exc:
+                  if exc.code not in (302, 307):
+                      raise
+                  location = exc.headers.get("Location")
+              if not location:
+                  raise ValueError("missing_location")
+              parts = urllib.parse.urlsplit(location)
+              if (parts.scheme != "https" or not parts.hostname
+                      or parts.username or parts.password):
+                  raise ValueError("invalid_location")
+              return read_bounded(
+                  urllib.request.urlopen(
+                      urllib.request.Request(
+                          location, headers={"User-Agent": "clean-publication-auditor-v1"}
+                      ), timeout=30,
+                  ), limit,
+              )
+
+          def no_duplicate_keys(pairs):
+              obj = {}
+              for key, value in pairs:
+                  if key in obj:
+                      raise ValueError("duplicate_public_key")
+                  obj[key] = value
+              return obj
+
+          def audit():
+              repo = os.environ["REPO"]
+              run_id = os.environ["RUN_ID"]
+              if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+                  raise ValueError("repo")
+              if not re.fullmatch(r"[0-9]{1,24}", run_id):
+                  raise ValueError("run")
+              prefix = "/repos/" + repo
+              jobs = api_json(prefix + "/actions/runs/" + run_id + "/jobs?per_page=100")
+              if jobs.get("total_count", 0) > 100:
+                  raise ValueError("unbounded_jobs")
+              protocol_jobs = [
+                  j for j in jobs["jobs"]
+                  if j.get("name") == "protocol"
+                  and j.get("status") == "completed"
+                  and j.get("conclusion") == "success"
+              ]
+              if len(protocol_jobs) != 1:
+                  raise ValueError("protocol_job")
+              logs = download_without_forwarding_token(
+                  prefix + "/actions/jobs/" + str(protocol_jobs[0]["id"]) + "/logs",
+                  1_500_000,
+              )
+              # These tests recognize runtime-derived canary material and common
+              # private-key/token patterns without needing their actual values.
+              forbidden = (
+                  rb"PRIVATE-RUNTIME-CANARY-[0-9a-f]{64}",
+                  rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
+                  rb"github_pat_[A-Za-z0-9_]{20,}",
+                  rb"gh[pousr]_[A-Za-z0-9_]{30,}",
+              )
+              if any(re.search(pattern, logs) for pattern in forbidden):
+                  raise ValueError("log_private_pattern")
+              if b"OPAQUE_CAPSULE_PROTOCOL_PASS=1" not in logs:
+                  raise ValueError("missing_protocol_receipt")
+              if b"CLEAN_ROOM_ARTIFACT_CIPHERTEXT_ONLY=PASS" not in logs:
+                  raise ValueError("missing_artifact_receipt")
+              if b"CLEAN_ROOM_PRIVATE_CONSUMER_DURABLE_ACK=0" not in logs:
+                  raise ValueError("missing_ack_boundary")
+
+              listing = api_json(prefix + "/actions/runs/" + run_id + "/artifacts?per_page=100")
+              artifacts = listing.get("artifacts", [])
+              if listing.get("total_count") != 1 or len(artifacts) != 1:
+                  raise ValueError("unexpected_artifacts")
+              artifact = artifacts[0]
+              if artifact.get("name") != "opaque-result-envelope" or artifact.get("expired"):
+                  raise ValueError("artifact_name")
+              archive = download_without_forwarding_token(
+                  prefix + "/actions/artifacts/" + str(artifact["id"]) + "/zip",
+                  1_500_000,
+              )
+              with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+                  if bundle.namelist() != ["opaque-result-envelope.json"]:
+                      raise ValueError("artifact_zip_members")
+                  member = bundle.infolist()[0]
+                  if member.file_size > 1_500_000 or member.is_dir():
+                      raise ValueError("artifact_member_size")
+                  obj = json.loads(bundle.read(member), object_pairs_hook=no_duplicate_keys)
+              allowed = {
+                  "schema", "run_id", "direction", "recipient_key_id",
+                  "sender_public_b64", "nonce_b64", "ciphertext_b64",
+                  "ciphertext_sha256",
+              }
+              if (not isinstance(obj, dict) or set(obj) != allowed
+                      or obj["schema"] != "opaque-capsule-v1"
+                      or obj["direction"] != "result" or obj["run_id"] != run_id
+                      or not isinstance(obj["recipient_key_id"], str)
+                      or not obj["recipient_key_id"].startswith("sha256:")):
+                  raise ValueError("public_envelope_shape")
+              sender = base64.b64decode(obj["sender_public_b64"], validate=True)
+              nonce = base64.b64decode(obj["nonce_b64"], validate=True)
+              ciphertext = base64.b64decode(obj["ciphertext_b64"], validate=True)
+              if (len(sender) != 32 or len(nonce) != 12
+                      or len(ciphertext) - 16 not in (4096, 16384, 65536, 262144, 1048576)
+                      or hashlib.sha256(ciphertext).hexdigest() != obj["ciphertext_sha256"]):
+                  raise ValueError("public_ciphertext_integrity")
+
+          try:
+              audit()
+          except Exception:
+              print("CLEAN_ROOM_INDEPENDENT_PUBLICATION_AUDIT=FAIL_CLOSED")
+              sys.exit(1)
+          print("CLEAN_ROOM_INDEPENDENT_PUBLICATION_AUDIT=PASS")
+          PY
