@@ -65,8 +65,12 @@ jobs:
           python -B -m unittest -q \
             tests.test_opaque_bidirectional_capsule_v1 \
             tests.test_opaque_bidirectional_capsule_p256_aesgcm_v1
-      - name: Execute encrypted request and encrypted result roundtrip
-        run: python -B scripts/opaque_bidirectional_capsule_smoke_v1.py
+      - name: Execute encrypted request and runtime-private-canary return
+        shell: bash
+        run: |
+          set -euo pipefail
+          ulimit -c 0
+          python -B scripts/opaque_bidirectional_capsule_smoke_v1.py
       - name: Prove isolated worker key custody and encrypted two-process handoff
         shell: bash
         run: |
@@ -82,21 +86,25 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY'
-          import base64,json,os
+          import base64,hashlib,json,os
           from pathlib import Path
+          from scripts.opaque_bidirectional_capsule_v1 import BUCKETS, FIELDS, SCHEMA
           data=Path('opaque-result-envelope.json').read_bytes()
           if len(data)>1_500_000:
               raise SystemExit('CLEAN_ROOM_ARTIFACT=REJECTED')
           x=json.loads(data)
-          allowed={'schema','run_id','direction','recipient_key_id',
-                   'sender_public_b64','nonce_b64','ciphertext_b64','ciphertext_sha256'}
-          if set(x)!=allowed or x['schema']!='opaque-capsule-v1' or x['run_id']!=os.environ['GITHUB_RUN_ID'] or x['direction']!='result':
+          if (set(x)!=FIELDS or x['schema']!=SCHEMA
+                  or x['run_id']!=os.environ['GITHUB_RUN_ID']
+                  or x['direction']!='result'):
               raise SystemExit('CLEAN_ROOM_ARTIFACT=REJECTED')
           if not x['recipient_key_id'].startswith('sha256:'):
               raise SystemExit('CLEAN_ROOM_ARTIFACT=REJECTED')
-          if len(base64.b64decode(x['nonce_b64'],validate=True))!=12:
-              raise SystemExit('CLEAN_ROOM_ARTIFACT=REJECTED')
-          if b'NEVER_PUBLISH_THIS_MARKER' in data:
+          sender=base64.b64decode(x['sender_public_b64'],validate=True)
+          nonce=base64.b64decode(x['nonce_b64'],validate=True)
+          cipher=base64.b64decode(x['ciphertext_b64'],validate=True)
+          if (len(sender)!=32 or len(nonce)!=12 or
+                  len(cipher)-16 not in BUCKETS or
+                  hashlib.sha256(cipher).hexdigest()!=x['ciphertext_sha256']):
               raise SystemExit('CLEAN_ROOM_ARTIFACT=REJECTED')
           print('CLEAN_ROOM_ARTIFACT_CIPHERTEXT_ONLY=PASS')
           PY
