@@ -156,6 +156,7 @@ jobs:
           import os
           import re
           import sys
+          import time
           import urllib.error
           import urllib.parse
           import urllib.request
@@ -215,6 +216,17 @@ jobs:
                   ), limit,
               )
 
+          def publication_retry(fn):
+              # A just-completed GitHub job/artifact may be indexed slightly
+              # after the dependent audit job starts. Never retry auth errors.
+              for attempt in range(5):
+                  try:
+                      return fn()
+                  except urllib.error.HTTPError as exc:
+                      if exc.code not in (404, 425, 502, 503) or attempt == 4:
+                          raise
+                      time.sleep(2)
+
           def no_duplicate_keys(pairs):
               obj = {}
               for key, value in pairs:
@@ -246,10 +258,10 @@ jobs:
               if len(protocol_jobs) != 1:
                   raise ValueError("protocol_job")
               STAGE[0] = "LOG_API"
-              logs = download_without_forwarding_token(
+              logs = publication_retry(lambda: download_without_forwarding_token(
                   prefix + "/actions/jobs/" + str(protocol_jobs[0]["id"]) + "/logs",
                   1_500_000,
-              )
+              ))
               # These tests recognize runtime-derived canary material and common
               # private-key/token patterns without needing their actual values.
               STAGE[0] = "LOG_PATTERN"
@@ -269,7 +281,13 @@ jobs:
                   raise ValueError("missing_ack_boundary")
 
               STAGE[0] = "ARTIFACT_LIST_API"
-              listing = api_json(prefix + "/actions/runs/" + run_id + "/artifacts?per_page=100")
+              for attempt in range(5):
+                  listing = publication_retry(lambda: api_json(
+                      prefix + "/actions/runs/" + run_id + "/artifacts?per_page=100"
+                  ))
+                  if listing.get("total_count") != 0 or attempt == 4:
+                      break
+                  time.sleep(2)
               artifacts = listing.get("artifacts", [])
               if listing.get("total_count") != 1 or len(artifacts) != 1:
                   raise ValueError("unexpected_artifacts")
@@ -277,10 +295,10 @@ jobs:
               if artifact.get("name") != "opaque-result-envelope" or artifact.get("expired"):
                   raise ValueError("artifact_name")
               STAGE[0] = "ARTIFACT_ZIP_API"
-              archive = download_without_forwarding_token(
+              archive = publication_retry(lambda: download_without_forwarding_token(
                   prefix + "/actions/artifacts/" + str(artifact["id"]) + "/zip",
                   1_500_000,
-              )
+              ))
               STAGE[0] = "ARTIFACT_ZIP_SHAPE"
               with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
                   if bundle.namelist() != ["opaque-result-envelope.json"]:
