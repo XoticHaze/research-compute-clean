@@ -223,6 +223,8 @@ jobs:
                   obj[key] = value
               return obj
 
+          STAGE = ["START"]
+
           def audit():
               repo = os.environ["REPO"]
               run_id = os.environ["RUN_ID"]
@@ -231,6 +233,7 @@ jobs:
               if not re.fullmatch(r"[0-9]{1,24}", run_id):
                   raise ValueError("run")
               prefix = "/repos/" + repo
+              STAGE[0] = "JOBS_API"
               jobs = api_json(prefix + "/actions/runs/" + run_id + "/jobs?per_page=100")
               if jobs.get("total_count", 0) > 100:
                   raise ValueError("unbounded_jobs")
@@ -242,12 +245,14 @@ jobs:
               ]
               if len(protocol_jobs) != 1:
                   raise ValueError("protocol_job")
+              STAGE[0] = "LOG_API"
               logs = download_without_forwarding_token(
                   prefix + "/actions/jobs/" + str(protocol_jobs[0]["id"]) + "/logs",
                   1_500_000,
               )
               # These tests recognize runtime-derived canary material and common
               # private-key/token patterns without needing their actual values.
+              STAGE[0] = "LOG_PATTERN"
               forbidden = (
                   rb"PRIVATE-RUNTIME-CANARY-[0-9a-f]{64}",
                   rb"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----",
@@ -263,6 +268,7 @@ jobs:
               if b"CLEAN_ROOM_PRIVATE_CONSUMER_DURABLE_ACK=0" not in logs:
                   raise ValueError("missing_ack_boundary")
 
+              STAGE[0] = "ARTIFACT_LIST_API"
               listing = api_json(prefix + "/actions/runs/" + run_id + "/artifacts?per_page=100")
               artifacts = listing.get("artifacts", [])
               if listing.get("total_count") != 1 or len(artifacts) != 1:
@@ -270,10 +276,12 @@ jobs:
               artifact = artifacts[0]
               if artifact.get("name") != "opaque-result-envelope" or artifact.get("expired"):
                   raise ValueError("artifact_name")
+              STAGE[0] = "ARTIFACT_ZIP_API"
               archive = download_without_forwarding_token(
                   prefix + "/actions/artifacts/" + str(artifact["id"]) + "/zip",
                   1_500_000,
               )
+              STAGE[0] = "ARTIFACT_ZIP_SHAPE"
               with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
                   if bundle.namelist() != ["opaque-result-envelope.json"]:
                       raise ValueError("artifact_zip_members")
@@ -281,6 +289,7 @@ jobs:
                   if member.file_size > 1_500_000 or member.is_dir():
                       raise ValueError("artifact_member_size")
                   obj = json.loads(bundle.read(member), object_pairs_hook=no_duplicate_keys)
+              STAGE[0] = "ENVELOPE_SHAPE"
               allowed = {
                   "schema", "run_id", "direction", "recipient_key_id",
                   "sender_public_b64", "nonce_b64", "ciphertext_b64",
@@ -292,6 +301,7 @@ jobs:
                       or not isinstance(obj["recipient_key_id"], str)
                       or not obj["recipient_key_id"].startswith("sha256:")):
                   raise ValueError("public_envelope_shape")
+              STAGE[0] = "ENVELOPE_CRYPTO_SHAPE"
               sender = base64.b64decode(obj["sender_public_b64"], validate=True)
               nonce = base64.b64decode(obj["nonce_b64"], validate=True)
               ciphertext = base64.b64decode(obj["ciphertext_b64"], validate=True)
@@ -303,7 +313,7 @@ jobs:
           try:
               audit()
           except Exception:
-              print("CLEAN_ROOM_INDEPENDENT_PUBLICATION_AUDIT=FAIL_CLOSED")
+              print("CLEAN_ROOM_INDEPENDENT_PUBLICATION_AUDIT=FAIL_CLOSED_STAGE_" + STAGE[0])
               sys.exit(1)
           print("CLEAN_ROOM_INDEPENDENT_PUBLICATION_AUDIT=PASS")
           PY
