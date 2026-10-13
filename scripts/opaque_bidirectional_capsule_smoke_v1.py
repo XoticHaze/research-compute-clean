@@ -263,14 +263,24 @@ def external_execute_capsule(envelope: dict, request_private: str, run_id: str) 
     return response
 
 
-def external_worker() -> int:
+def external_worker(publish_offer: bool = False) -> int:
     import re
     import time
     import urllib.request
+    import urllib.error
     from scripts.opaque_bidirectional_capsule_p256_aesgcm_v1 import generate_keypair as generate_p256
     run_id = os.environ.get("GITHUB_RUN_ID", "")
     repo = os.environ.get("GITHUB_REPOSITORY", "")
     if not re.fullmatch(r"[1-9][0-9]{0,19}", run_id) or repo != "XoticHaze/research-compute-clean":
+        print("CLEAN_EXTERNAL_WORKER=FAIL_CLOSED")
+        return 1
+    if publish_offer and (
+        os.environ.get("GITHUB_EVENT_NAME") != "pull_request_target"
+        or os.environ.get("GITHUB_BASE_REF") != "main"
+        or os.environ.get("GITHUB_REPOSITORY_ID") != "1416551057"
+        or not re.fullmatch(r"security/clean-external-probe-[0-9]{8}",
+                            os.environ.get("GITHUB_HEAD_REF", ""))
+    ):
         print("CLEAN_EXTERNAL_WORKER=FAIL_CLOSED")
         return 1
     try:
@@ -282,8 +292,43 @@ def external_worker() -> int:
             "recipient_key_id": key_id,
             "repository_id": "1416551057",
         }
-        # Public one-time encryption offer, not a proof of OIDC/broker issuer.
-        print("CLEAN_EXTERNAL_OFFER_JSON=" + json.dumps(offer, sort_keys=True, separators=(",", ":")), flush=True)
+
+        def publish_public_exchange(kind: str, node: dict) -> None:
+            if kind not in {"offer", "result"}:
+                raise RuntimeError("exchange_publish_kind_rejected")
+            token = os.environ.get("GH_TOKEN", "")
+            if not token:
+                raise RuntimeError("exchange_write_token_missing")
+            path = f"rendezvous/{run_id}/{kind}.json"
+            content = base64.b64encode(
+                (json.dumps(node, sort_keys=True, separators=(",", ":")) + "\n").encode()
+            ).decode()
+            posted = json.dumps({
+                "message": "proof: publish encrypted external synthetic exchange object",
+                "content": content, "branch": "clean-synthetic-exchange",
+            }, separators=(",", ":")).encode()
+            put = urllib.request.Request(
+                f"https://api.github.com/repos/{repo}/contents/{path}",
+                data=posted, method="PUT", headers={
+                    "Authorization": "Bearer " + token,
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                    "Content-Type": "application/json",
+                    "User-Agent": "clean-external-proof-v1",
+                })
+            with urllib.request.urlopen(put, timeout=15) as response:
+                if response.status != 201:
+                    raise RuntimeError("exchange_publish_rejected")
+                response.read(100)
+
+        if publish_offer:
+            publish_public_exchange("offer", offer)
+            print("CLEAN_EXTERNAL_PUBLIC_OFFER_PUBLISHED=1", flush=True)
+        else:
+            # Old read-only source acceptance mode still prints only the
+            # public offer for diagnostic compatibility, without secret keys.
+            print("CLEAN_EXTERNAL_OFFER_JSON=" + json.dumps(
+                offer, sort_keys=True, separators=(",", ":")), flush=True)
         url = (f"https://api.github.com/repos/{repo}/contents/"
                f"rendezvous/{run_id}/request.json?ref=clean-synthetic-exchange")
         token = os.environ.get("GH_TOKEN", "")
@@ -319,7 +364,11 @@ def external_worker() -> int:
         if len(line) > 120_000:
             raise RuntimeError("external_result_oversized")
         Path("opaque-result-envelope.json").write_text(line + "\n", encoding="utf-8")
-        print("CLEAN_EXTERNAL_RESULT_JSON=" + line, flush=True)
+        if publish_offer:
+            publish_public_exchange("result", result)
+            print("CLEAN_EXTERNAL_PUBLIC_CIPHERTEXT_RESULT_PUBLISHED=1", flush=True)
+        else:
+            print("CLEAN_EXTERNAL_RESULT_JSON=" + line, flush=True)
         print("CLEAN_EXTERNAL_PUBLIC_ENCRYPTED_RESULT=PASS", flush=True)
         print("CLEAN_EXTERNAL_DURABLE_PRIVATE_ACK=0", flush=True)
         return 0
@@ -334,6 +383,8 @@ if __name__ == "__main__":
     args = sys.argv[1:]
     if args == ["--external-synthetic-worker"]:
         raise SystemExit(external_worker())
+    if args == ["--external-synthetic-worker-publish"]:
+        raise SystemExit(external_worker(publish_offer=True))
     if args == ["--two-process"]:
         raise SystemExit(two_process_proof("success"))
     if args == ["--two-process-tamper"]:
