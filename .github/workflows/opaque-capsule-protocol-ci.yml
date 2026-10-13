@@ -80,7 +80,7 @@ jobs:
           x=json.loads(data)
           allowed={'schema','run_id','direction','recipient_key_id',
                    'sender_public_b64','nonce_b64','ciphertext_b64','ciphertext_sha256'}
-          if set(x)!=allowed or x['schema']!='opaque-capsule-x25519-v1' or x['run_id']!=os.environ['GITHUB_RUN_ID'] or x['direction']!='result':
+          if set(x)!=allowed or x['schema']!='opaque-capsule-v1' or x['run_id']!=os.environ['GITHUB_RUN_ID'] or x['direction']!='result':
               raise SystemExit('CLEAN_ROOM_ARTIFACT=REJECTED')
           if not x['recipient_key_id'].startswith('sha256:'):
               raise SystemExit('CLEAN_ROOM_ARTIFACT=REJECTED')
