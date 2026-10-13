@@ -228,9 +228,112 @@ def two_process_proof(mode: str) -> int:
             except Exception:
                 pass
 
+
+# External synthetic-only private authority rendezvous. Uses the canonical
+# P-256/AES-GCM module already installed; not a new crypto or router profile.
+# Never accepts job commands, arbitrary source code, or sensitive real data.
+def external_execute_capsule(envelope: dict, request_private: str, run_id: str) -> dict:
+    from scripts.opaque_bidirectional_capsule_p256_aesgcm_v1 import (
+        open_capsule as p256_open, seal as p256_seal,
+    )
+    raw = p256_open(envelope, recipient_private_b64=request_private,
+                    expected_run_id=run_id, expected_direction="request")
+    if len(raw) > 4096:
+        raise RuntimeError("external_request_oversized")
+    body = json.loads(raw)
+    if (not isinstance(body, dict) or
+            set(body) != {"schema", "opaque_input_b64", "return_public_b64"}
+            or body["schema"] != "clean-external-synthetic-v1"):
+        raise RuntimeError("external_request_schema_rejected")
+    source = base64.b64decode(body["opaque_input_b64"], validate=True)
+    if not (16 <= len(source) <= 160) or not source.startswith(b"SYNTHETIC-EXTERNAL-CANARY-"):
+        raise RuntimeError("external_input_scope_rejected")
+    result_body = json.dumps({
+        "schema": "clean-external-synthetic-result-v1",
+        "private_echo_b64": base64.b64encode(source).decode("ascii"),
+        "private_digest": hashlib.sha256(source).hexdigest(),
+    }, sort_keys=True, separators=(",", ":")).encode()
+    response = p256_seal(result_body, recipient_public_b64=body["return_public_b64"],
+                         run_id=run_id, direction="result")
+    # Only AEAD envelope is permitted beyond worker.
+    if set(response) != __import__(
+            "scripts.opaque_bidirectional_capsule_p256_aesgcm_v1",
+            fromlist=["FIELDS"]).FIELDS:
+        raise RuntimeError("external_result_fields_rejected")
+    return response
+
+
+def external_worker() -> int:
+    import re
+    import time
+    import urllib.request
+    from scripts.opaque_bidirectional_capsule_p256_aesgcm_v1 import generate_keypair as generate_p256
+    run_id = os.environ.get("GITHUB_RUN_ID", "")
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    if not re.fullmatch(r"[1-9][0-9]{0,19}", run_id) or repo != "XoticHaze/research-compute-clean":
+        print("CLEAN_EXTERNAL_WORKER=FAIL_CLOSED")
+        return 1
+    try:
+        private, public, key_id = generate_p256()
+        offer = {
+            "schema": "clean-external-worker-offer-v1",
+            "run_id": run_id,
+            "recipient_public_b64": public,
+            "recipient_key_id": key_id,
+            "repository_id": "1416551057",
+        }
+        # Public one-time encryption offer, not a proof of OIDC/broker issuer.
+        print("CLEAN_EXTERNAL_OFFER_JSON=" + json.dumps(offer, sort_keys=True, separators=(",", ":")), flush=True)
+        url = (f"https://api.github.com/repos/{repo}/contents/"
+               f"rendezvous/{run_id}/request.json?ref=clean-synthetic-exchange")
+        token = os.environ.get("GH_TOKEN", "")
+        if not token:
+            raise RuntimeError("read_only_github_token_unavailable")
+        payload = None
+        for _ in range(72):
+            req = urllib.request.Request(url, headers={
+                "Authorization": "Bearer " + token,
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "clean-external-proof-v1",
+            })
+            try:
+                with urllib.request.urlopen(req, timeout=8) as response:
+                    node_bytes = response.read(120_001)
+                if len(node_bytes) > 120_000:
+                    raise RuntimeError("external_exchange_oversized")
+                node = json.loads(node_bytes)
+                content = base64.b64decode(str(node["content"]).encode(), validate=False)
+                if len(content) > 80_000:
+                    raise RuntimeError("external_envelope_oversized")
+                payload = json.loads(content)
+                break
+            except urllib.error.HTTPError as exc:
+                if exc.code != 404:
+                    raise RuntimeError("external_exchange_read_rejected") from None
+                time.sleep(3)
+        if payload is None:
+            raise RuntimeError("external_request_not_received")
+        result = external_execute_capsule(payload, private, run_id)
+        line = json.dumps(result, sort_keys=True, separators=(",", ":"))
+        if len(line) > 120_000:
+            raise RuntimeError("external_result_oversized")
+        Path("opaque-result-envelope.json").write_text(line + "\n", encoding="utf-8")
+        print("CLEAN_EXTERNAL_RESULT_JSON=" + line, flush=True)
+        print("CLEAN_EXTERNAL_PUBLIC_ENCRYPTED_RESULT=PASS", flush=True)
+        print("CLEAN_EXTERNAL_DURABLE_PRIVATE_ACK=0", flush=True)
+        return 0
+    except Exception:
+        # An untrusted request must not dump tracebacks, private keys, payload,
+        # URL details, or API error bodies to public Actions logs.
+        print("CLEAN_EXTERNAL_WORKER=FAIL_CLOSED")
+        return 1
+
 if __name__ == "__main__":
     # Preserves the initial single-process acceptance for comparison.
     args = sys.argv[1:]
+    if args == ["--external-synthetic-worker"]:
+        raise SystemExit(external_worker())
     if args == ["--two-process"]:
         raise SystemExit(two_process_proof("success"))
     if args == ["--two-process-tamper"]:

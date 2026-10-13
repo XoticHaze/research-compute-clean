@@ -81,6 +81,16 @@ jobs:
           python -B scripts/opaque_bidirectional_capsule_smoke_v1.py --two-process
           python -B scripts/opaque_bidirectional_capsule_smoke_v1.py --two-process-tamper
           python -B scripts/opaque_bidirectional_capsule_smoke_v1.py --two-process-wrong-run
+      - name: Admit run-bound synthetic request from independent private producer
+        if: ${{ github.event_name == 'pull_request' && startsWith(github.head_ref, 'security/clean-external-probe-') && github.event.pull_request.head.repo.full_name == github.repository }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ulimit -c 0
+          sudo -n swapoff -a || { echo "CLEAN_EXTERNAL_GUEST_SWAP=FAIL_CLOSED"; exit 1; }
+          python -B scripts/opaque_bidirectional_capsule_smoke_v1.py --external-synthetic-worker
       - name: Fail closed if generated public artifact contains non-envelope data
         shell: bash
         run: |
@@ -89,11 +99,12 @@ jobs:
           import base64,hashlib,json,os
           from pathlib import Path
           from scripts.opaque_bidirectional_capsule_v1 import BUCKETS, FIELDS, SCHEMA
+          from scripts.opaque_bidirectional_capsule_p256_aesgcm_v1 import SCHEMA as P256_SCHEMA
           data=Path('opaque-result-envelope.json').read_bytes()
           if len(data)>1_500_000:
               raise SystemExit('CLEAN_ROOM_ARTIFACT=REJECTED')
           x=json.loads(data)
-          if (set(x)!=FIELDS or x['schema']!=SCHEMA
+          if (set(x)!=FIELDS or x['schema'] not in {SCHEMA,P256_SCHEMA}
                   or x['run_id']!=os.environ['GITHUB_RUN_ID']
                   or x['direction']!='result'):
               raise SystemExit('CLEAN_ROOM_ARTIFACT=REJECTED')
